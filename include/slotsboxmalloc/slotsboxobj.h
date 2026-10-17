@@ -50,8 +50,14 @@ static inline sbo_usage_t sbo_align_to(uint64_t n_slots) {
     return r;
 }
 
-typedef struct { atomic_int lock; uint8_t _pad[60]; } sbo_lock_t;
+typedef struct {
+    atomic_int lock;
+    uint32_t   hot_id1[3];
+    uint64_t   hot_base[3];
+    uint8_t    _pad[24];
+} sbo_lock_t;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "atomic_int must be lock-free");
+_Static_assert(sizeof(sbo_lock_t) == 64, "sbo_lock_t must be 64 bytes");
 
 static inline void sbo_cpu_relax(void) {
 #ifdef __x86_64__
@@ -100,23 +106,32 @@ typedef struct {
     uint8_t  hint_child;
     uint8_t  parent_slot;
     uint8_t  child_max_count;
+    uint8_t  _pad;
+    uint8_t  states[SBO_N];
     uint16_t child_cap[SBO_N];
     int32_t  children[SBO_N];
-    uint8_t  states[SBO_N];
 } sbo_box_t;
 
 typedef struct {
     uint8_t  magic[16];
+    uint64_t head_size;
     uint64_t data_size;
+    uint64_t slot_bytes;
     uint64_t per_slot_meta;
-    uint32_t next_shard;
-    uint16_t block_stride;
     uint8_t  root_slots;
     uint8_t  shard_mask;
     uint8_t  slot_shift;
     uint8_t  box_off;
-    uint8_t  _pad[6];
+    uint16_t block_stride;
+    uint8_t  sizeof_block_head;
+    uint8_t  _pad;
+    uint32_t next_shard;
+    uint32_t max_blocks;
 } sbo_meta_t;
+_Static_assert(sizeof(sbo_meta_t) == 64, "sbo_meta_t must be 64 bytes");
+
+#define SBO_META_BASE sizeof(sbo_meta_t)
+#define SBO_BITMAP_B  (SBO_N / 8)
 
 int      sbo_init(void *metaptr, size_t head_size, size_t data_size);
 uint64_t sbo_alloc(void *metaptr, size_t size);
@@ -124,6 +139,9 @@ void     sbo_free(void *metaptr, uint64_t obj_offset);
 uint64_t sbo_allocated_size(void *metaptr, uint64_t obj_offset);
 void    *sbo_data_ptr(void *metaptr, void *data_base, uint64_t obj_offset);
 size_t   sbo_meta_size(size_t data_size, size_t per_slot_pool);
+bool     sbo_pool_full(sbo_meta_t *m);
+void     sbo_head_grow_apply(sbo_meta_t *m, uint64_t new_pool_bytes);
+int      sbo_data_grow_apply(sbo_meta_t *m, uint64_t new_data_size);
 
 #endif /* SLOTSBOXOBJ_H */
 
@@ -131,7 +149,8 @@ size_t   sbo_meta_size(size_t data_size, size_t per_slot_pool);
 
 #include <blockmalloc/blockmalloc.h>
 
-#define SBO_POOL_HDR (sizeof(blocks_meta_t) + sizeof(sbo_lock_t))
+#define SBO_POOL_HDR   (sizeof(blocks_meta_t) + sizeof(sbo_lock_t))
+#define SBO_HEAD_FIXED (sizeof(sbo_meta_t) + SBO_POOL_HDR)
 
 static inline blocks_meta_t *sbo_pool_meta(sbo_meta_t *meta, uint8_t si) {
     return (blocks_meta_t *)((uint8_t *)(meta + 1)) + si;
@@ -144,19 +163,26 @@ static inline uint8_t *sbo_pool_mem(sbo_meta_t *meta, uint8_t si) {
            + meta->root_slots * SBO_POOL_HDR
            + si * meta->per_slot_meta;
 }
+
 typedef struct {
     blocks_meta_t *pool_meta;
+    sbo_lock_t *lk;
     uint8_t *pool;
     uint32_t stride;
     uint32_t head;
+    uint32_t max_blocks;
+    int32_t last_id;
 } sbo_ctx_t;
 
-static inline sbo_ctx_t sbo_ctx_for(sbo_meta_t *meta, uint8_t si) {
+static inline sbo_ctx_t sbo_ctx_for(sbo_meta_t *meta, uint8_t si, sbo_lock_t *lk) {
     sbo_ctx_t c;
     c.pool_meta = sbo_pool_meta(meta, si);
+    c.lk = lk;
     c.pool = sbo_pool_mem(meta, si);
     c.stride = meta->block_stride;
     c.head = meta->box_off;
+    c.max_blocks = meta->max_blocks;
+    c.last_id = -1;
     return c;
 }
 static inline sbo_box_t *sbo_box_at(const sbo_ctx_t *c, int32_t id) {
@@ -164,15 +190,26 @@ static inline sbo_box_t *sbo_box_at(const sbo_ctx_t *c, int32_t id) {
 }
 
 static inline uint8_t sbo_mask_contmax(uint64_t m) {
-    uint8_t best = 0;
-    while (m) {
-        m >>= __builtin_ctzll(m);
-        int e = (m == ~0ULL) ? 64 : __builtin_ctzll(~m);
-        if (e > best) best = (uint8_t)e;
-        if (e >= 64) break;
-        m >>= e;
+    if (!m) return 0;
+    uint64_t u = m + (m & (~m + 1ULL));
+    if (__builtin_expect((u & (u - 1ULL)) == 0, 1)) {
+        int n = 64 - __builtin_clzll(m) - __builtin_ctzll(m);
+        return (uint8_t)(n > SBO_MULT_MAX ? SBO_MULT_MAX : n);
     }
-    return best;
+    uint64_t m2  = m   & (m   >> 1);
+    uint64_t m4  = m2  & (m2  >> 2);
+    uint64_t m8  = m4  & (m4  >> 4);
+    uint64_t m16 = m8  & (m8  >> 8);
+    uint64_t m32 = m16 & (m16 >> 16);
+    uint8_t best = 1;
+    uint64_t x = m, y;
+    if (m32) { x = m32; best += 32; }
+    y = (x >> 16) & m16; if (y) { x = y; best += 16; }
+    y = (x >> 8)  & m8;  if (y) { x = y; best += 8;  }
+    y = (x >> 4)  & m4;  if (y) { x = y; best += 4;  }
+    y = (x >> 2)  & m2;  if (y) { x = y; best += 2;  }
+    y = (x >> 1)  & m;   if (y) { best += 1; }
+    return best > SBO_MULT_MAX ? SBO_MULT_MAX : best;
 }
 
 static inline int sbo_mask_find_run(uint64_t m, int need) {
@@ -180,15 +217,27 @@ static inline int sbo_mask_find_run(uint64_t m, int need) {
     int len = 1;
     while (len * 2 <= need) { x &= (x >> len); len *= 2; }
     if (len < need) x &= (x >> (need - len));
-    if (!x) return -1;
-    return 63 - __builtin_clzll(x);
+    return x ? (63 - __builtin_clzll(x)) : -1;
 }
 
 static inline uint16_t sbo_combined(const sbo_box_t *box) {
-    uint16_t own = 0;
-    if (box->max_obj_cap == 64)      own = sbo_enc((uint8_t)(box->objlevel + 1), 1);
-    else if (box->max_obj_cap != 0)  own = sbo_enc(box->objlevel, box->max_obj_cap);
+    uint16_t own = box->max_obj_cap ? sbo_enc(box->objlevel, box->max_obj_cap) : 0;
     return own > box->child_max_enc ? own : box->child_max_enc;
+}
+
+static inline void sbo_rescan_child_max(sbo_box_t *p) {
+    uint16_t mx = 0;
+    uint8_t cnt = 0;
+    uint64_t mm = p->child_mask;
+    while (mm) {
+        int i = __builtin_ctzll(mm);
+        mm &= mm - 1;
+        uint16_t v = p->child_cap[i];
+        if (v > mx) { mx = v; cnt = 1; }
+        else if (v == mx) cnt++;
+    }
+    p->child_max_enc = mx;
+    p->child_max_count = cnt;
 }
 
 static inline void sbo_propagate(const sbo_ctx_t *c, sbo_box_t *box) {
@@ -197,29 +246,18 @@ static inline void sbo_propagate(const sbo_ctx_t *c, sbo_box_t *box) {
         sbo_box_t *p = sbo_box_at(c, box->parent);
         uint16_t old = p->child_cap[box->parent_slot];
         if (old == comb) return;
+        uint16_t p_old = sbo_combined(p);
         p->child_cap[box->parent_slot] = comb;
         if (comb > p->child_max_enc) {
             p->child_max_enc = comb;
             p->child_max_count = 1;
         } else if (comb == p->child_max_enc) {
             p->child_max_count++;
-        } else if (old == p->child_max_enc) {
-            if (--p->child_max_count == 0) {
-                uint16_t mx = 0;
-                uint8_t cnt = 0;
-                uint64_t mm = p->child_mask;
-                while (mm) {
-                    int i = __builtin_ctzll(mm);
-                    mm &= mm - 1;
-                    uint16_t v = p->child_cap[i];
-                    if (v > mx) { mx = v; cnt = 1; }
-                    else if (v == mx) cnt++;
-                }
-                p->child_max_enc = mx;
-                p->child_max_count = cnt;
-            }
+        } else if (old == p->child_max_enc && --p->child_max_count == 0) {
+            sbo_rescan_child_max(p);
         }
         comb = sbo_combined(p);
+        if (comb == p_old) return;
         box = p;
     }
 }
@@ -227,8 +265,10 @@ static inline void sbo_propagate(const sbo_ctx_t *c, sbo_box_t *box) {
 static inline void sbo_after_mask_change(const sbo_ctx_t *c, sbo_box_t *box) {
     uint8_t old = box->max_obj_cap;
     uint8_t nc = sbo_mask_contmax(box->free_mask);
-    box->max_obj_cap = nc;
-    if (nc != old) sbo_propagate(c, box);
+    if (nc != old) {
+        box->max_obj_cap = nc;
+        sbo_propagate(c, box);
+    }
 }
 
 static inline void sbo_box_format(sbo_box_t *box, uint8_t objlevel,
@@ -240,20 +280,68 @@ static inline void sbo_box_format(sbo_box_t *box, uint8_t objlevel,
     box->self_id = self_id;
     box->child_max_enc = 0;
     box->objlevel = objlevel;
-    box->max_obj_cap = SBO_N;
+    box->max_obj_cap = SBO_MULT_MAX;
     box->hint_child = 0;
     box->parent_slot = parent_slot;
     box->child_max_count = 0;
-    memset(box->child_cap, 0, sizeof(box->child_cap));
-    memset(box->children, 0xFF, sizeof(box->children));
     memset(box->states, 0, sizeof(box->states));
 }
 
-static inline int sbo_alloc_obj_slots(const sbo_ctx_t *c, sbo_box_t *box, uint8_t m) {
-    int s = sbo_mask_find_run(box->free_mask, m);
+static bool sbo_reclaim_empty(const sbo_ctx_t *c, sbo_box_t *box) {
+    bool any = false;
+    uint64_t mm = box->child_mask;
+    while (mm) {
+        int i = __builtin_ctzll(mm);
+        mm &= mm - 1;
+        sbo_box_t *ch = sbo_box_at(c, box->children[i]);
+        if (ch->child_mask) sbo_reclaim_empty(c, ch);
+        if (ch->free_mask == ~0ULL && ch->child_mask == 0) {
+            int32_t cid = ch->self_id;
+            uint8_t lv = ch->objlevel;
+            if (lv >= 1 && lv <= 3 && c->lk->hot_id1[lv - 1] == (uint32_t)cid + 1)
+                c->lk->hot_id1[lv - 1] = 0;
+            blocks_free(c->pool_meta, c->pool, (uint64_t)cid);
+            box->child_mask &= ~(1ULL << i);
+            box->free_mask |= (1ULL << i);
+            box->states[i] = SBO_FREE;
+            box->child_cap[i] = 0;
+            any = true;
+        }
+    }
+    if (any) {
+        sbo_rescan_child_max(box);
+        box->hint_child = box->child_mask ? (uint8_t)__builtin_ctzll(box->child_mask) : 0;
+        box->max_obj_cap = sbo_mask_contmax(box->free_mask);
+        sbo_propagate(c, box);
+    }
+    return any;
+}
+
+static inline int sbo_alloc_obj_slots(sbo_ctx_t *c, sbo_box_t *box, uint8_t m) {
+    uint64_t fm = box->free_mask;
+    if (!fm) return -1;
+    uint64_t u = fm + (fm & (~fm + 1ULL));
+    if (__builtin_expect((u & (u - 1ULL)) == 0, 1)) {
+        int hi = 64 - __builtin_clzll(fm);
+        int k = hi - __builtin_ctzll(fm);
+        if (k < (int)m) return -1;
+        int s = hi - (int)m;
+        box->free_mask = fm & ~(((1ULL << m) - 1ULL) << s);
+        box->states[s] = SBO_START(m);
+        c->last_id = box->self_id;
+        int rem = k - (int)m;
+        uint8_t nc = (uint8_t)(rem > SBO_MULT_MAX ? SBO_MULT_MAX : rem);
+        if (nc != box->max_obj_cap) {
+            box->max_obj_cap = nc;
+            sbo_propagate(c, box);
+        }
+        return s;
+    }
+    int s = sbo_mask_find_run(fm, m);
     if (s < 0) return -1;
-    box->free_mask &= ~(((1ULL << m) - 1) << s);
+    box->free_mask = fm & ~(((1ULL << m) - 1ULL) << s);
     box->states[s] = SBO_START(m);
+    c->last_id = box->self_id;
     sbo_after_mask_change(c, box);
     return s;
 }
@@ -261,41 +349,51 @@ static inline int sbo_alloc_obj_slots(const sbo_ctx_t *c, sbo_box_t *box, uint8_
 static inline void sbo_free_obj_slots(const sbo_ctx_t *c, sbo_box_t *box, uint8_t start) {
     int len = SBO_START_LEN(box->states[start]);
     if (start + len > SBO_N) return;
-    memset(box->states + start, SBO_FREE, (size_t)len);
-    box->free_mask |= (((1ULL << len) - 1) << start);
+    box->states[start] = SBO_FREE;
+    box->free_mask |= (((1ULL << len) - 1ULL) << start);
     sbo_after_mask_change(c, box);
 }
 
 #define SBO_ALLOC_FAIL ((uint64_t)-1)
 
-static uint64_t sbo_find_alloc(const sbo_ctx_t *c, sbo_box_t *box,
+static uint64_t sbo_find_alloc(sbo_ctx_t *c, sbo_box_t *box,
                                sbo_usage_t usage, uint16_t need_enc) {
     if (usage.level == box->objlevel) {
         int slot = sbo_alloc_obj_slots(c, box, usage.multiple);
+        if (slot < 0 && box->child_mask && sbo_reclaim_empty(c, box))
+            slot = sbo_alloc_obj_slots(c, box, usage.multiple);
         if (slot < 0) return SBO_ALLOC_FAIL;
         return sbo_offset_raw(box->objlevel, (uint8_t)slot);
     }
     if (usage.level > box->objlevel) return SBO_ALLOC_FAIL;
 
-    int start = box->hint_child;
-    for (int part = 0; part < 2; part++) {
-        uint64_t mm = (part == 0)
-            ? (box->child_mask & (~0ULL << start))
-            : (box->child_mask & ((start == 0) ? 0ULL : ((1ULL << start) - 1)));
-        while (mm) {
-            int i = __builtin_ctzll(mm);
-            mm &= mm - 1;
-            if (box->child_cap[i] < need_enc) continue;
-            uint64_t sub = sbo_find_alloc(c, sbo_box_at(c, box->children[i]),
-                                          usage, need_enc);
-            if (sub != SBO_ALLOC_FAIL) {
-                if (box->hint_child != (uint8_t)i) box->hint_child = (uint8_t)i;
-                return sbo_offset_raw(box->objlevel, (uint8_t)i) + sub;
+    if (box->child_max_enc >= need_enc) {
+        int start = box->hint_child;
+        for (int part = 0; part < 2; part++) {
+            uint64_t mm = (part == 0)
+                ? (box->child_mask & (~0ULL << start))
+                : (box->child_mask & ((start == 0) ? 0ULL : ((1ULL << start) - 1)));
+            while (mm) {
+                int i = __builtin_ctzll(mm);
+                mm &= mm - 1;
+                if (box->child_cap[i] < need_enc) continue;
+                uint64_t sub = sbo_find_alloc(c, sbo_box_at(c, box->children[i]),
+                                              usage, need_enc);
+                if (sub != SBO_ALLOC_FAIL) {
+                    if (box->hint_child != (uint8_t)i) box->hint_child = (uint8_t)i;
+                    return sbo_offset_raw(box->objlevel, (uint8_t)i) + sub;
+                }
             }
         }
     }
 
-    if (!box->free_mask) return SBO_ALLOC_FAIL;
+    uint32_t need_blk = (uint32_t)(box->objlevel - usage.level);
+    if (!box->free_mask || c->max_blocks - (uint32_t)c->pool_meta->used_blocks < need_blk) {
+        sbo_reclaim_empty(c, sbo_box_at(c, 0));
+        if (!box->free_mask || c->max_blocks - (uint32_t)c->pool_meta->used_blocks < need_blk)
+            return SBO_ALLOC_FAIL;
+    }
+
     int64_t cid = blocks_alloc(c->pool_meta, c->pool);
     if (cid < 0) return SBO_ALLOC_FAIL;
     int slot = __builtin_ctzll(box->free_mask);
@@ -318,6 +416,13 @@ static uint64_t sbo_find_alloc(const sbo_ctx_t *c, sbo_box_t *box,
 
     uint64_t sub = sbo_find_alloc(c, ch, usage, need_enc);
     if (sub == SBO_ALLOC_FAIL) {
+        blocks_free(c->pool_meta, c->pool, (uint64_t)cid);
+        box->child_mask &= ~(1ULL << slot);
+        box->free_mask |= (1ULL << slot);
+        box->states[slot] = SBO_FREE;
+        box->child_cap[slot] = 0;
+        sbo_rescan_child_max(box);
+        box->max_obj_cap = sbo_mask_contmax(box->free_mask);
         sbo_propagate(c, box);
         return SBO_ALLOC_FAIL;
     }
@@ -327,21 +432,23 @@ static uint64_t sbo_find_alloc(const sbo_ctx_t *c, sbo_box_t *box,
 
 static inline sbo_box_t *sbo_find_obj_node(const sbo_ctx_t *c, sbo_box_t *root,
                                            uint64_t obj_offset, uint8_t *out_slot) {
-    if (root->objlevel == 0 || root->objlevel > 11) return NULL;
+    if (root->objlevel == 0 || root->objlevel > 10) return NULL;
     uint64_t unit = obj_offset >> 3;
     sbo_box_t *node = root;
     int level = node->objlevel;
     while (level >= 1) {
-        uint8_t slot = (uint8_t)((unit >> ((level - 1) * SBO_N_BITS)) & SBO_N_MASK);
-        uint8_t st = node->states[slot];
-        if (SBO_IS_START(st) && slot + SBO_START_LEN(st) <= SBO_N) {
-            *out_slot = slot;
-            return node;
-        }
-        if (st == SBO_BOX && node->children[slot] >= 0) {
+        uint32_t sh = (uint32_t)(level - 1) * SBO_N_BITS;
+        uint8_t slot = (uint8_t)((unit >> sh) & SBO_N_MASK);
+        if ((node->child_mask >> slot) & 1ULL) {
             node = sbo_box_at(c, node->children[slot]);
             level--;
             continue;
+        }
+        uint8_t st = node->states[slot];
+        if (SBO_IS_START(st) && (unit & ((1ULL << sh) - 1)) == 0
+            && slot + SBO_START_LEN(st) <= SBO_N) {
+            *out_slot = slot;
+            return node;
         }
         return NULL;
     }
@@ -359,7 +466,7 @@ static inline bool sbo_magic_ok(const sbo_meta_t *meta) {
     memcpy(&got1, meta->magic + 8, 8);
     memcpy(&want0, SBO_MAGIC, 8);
     memcpy(&want1, SBO_MAGIC + 8, 8);
-    return got0 == want0 && got1 == want1;
+    return ((got0 ^ want0) | (got1 ^ want1)) == 0;
 }
 
 static inline bool sbo_meta_ok(const sbo_meta_t *meta) {
@@ -377,12 +484,12 @@ static inline bool sbo_meta_ok(const sbo_meta_t *meta) {
 }
 
 #ifndef SBO_NO_TLS
-static __thread const void *sbo_tls_meta;
-static __thread int sbo_tls_home = -1;
+typedef struct { const void *meta; int16_t home; uint16_t miss; } sbo_tls_t;
+static __thread sbo_tls_t sbo_tls __attribute__((tls_model("initial-exec"))) = {NULL, -1, 0};
 #endif
 
 static inline int sbo_next_home(sbo_meta_t *meta) {
-    return (int)(__atomic_fetch_add(&meta->next_shard, 1u, __ATOMIC_RELAXED)
+    return (int)((__atomic_fetch_add(&meta->next_shard, 1u, __ATOMIC_RELAXED) * 9u)
                  & meta->shard_mask);
 }
 
@@ -391,24 +498,25 @@ static inline int sbo_home_shard(sbo_meta_t *meta) {
 #ifdef SBO_NO_TLS
     return sbo_next_home(meta);
 #else
-    if (sbo_tls_meta != (const void *)meta || sbo_tls_home < 0
-        || sbo_tls_home > meta->shard_mask) {
-        sbo_tls_meta = (const void *)meta;
-        sbo_tls_home = sbo_next_home(meta);
+    if (sbo_tls.meta != (const void *)meta || sbo_tls.home < 0
+        || sbo_tls.home > meta->shard_mask) {
+        sbo_tls.meta = (const void *)meta;
+        sbo_tls.home = (int16_t)sbo_next_home(meta);
+        sbo_tls.miss = 0;
     }
-    return sbo_tls_home;
+    return sbo_tls.home;
 #endif
 }
 
 #define SBO_MIN_POOL_BLOCKS 32
 
 int sbo_init(void *metaptr, size_t head_size, size_t data_size) {
-    if (!metaptr || data_size % 8 != 0) return -1;
-    if (((uintptr_t)metaptr & 7) != 0) return -1;
+    if (!metaptr || ((uintptr_t)metaptr & 7) != 0) return -1;
+    if (head_size <= sizeof(sbo_meta_t) + SBO_POOL_HDR || (data_size & 7) != 0) return -1;
     sbo_meta_t *meta = (sbo_meta_t *)metaptr;
     if (sbo_magic_ok(meta)) return -1;
 
-    uint64_t slots = data_size / 8;
+    uint64_t slots = data_size >> 3;
     if (slots < SBO_N || (slots & (slots - 1)) != 0) return -1;
     if (__builtin_ctzll(slots) % SBO_N_BITS != 0) return -1;
 
@@ -426,7 +534,9 @@ int sbo_init(void *metaptr, size_t head_size, size_t data_size) {
     if (per_slot_meta < sizeof(sbo_box_t) + 16) return -1;
 
     memset(meta, 0, sizeof(*meta));
+    meta->head_size = head_size;
     meta->data_size = data_size;
+    meta->slot_bytes = data_size / shards;
     meta->root_slots = shards;
     meta->shard_mask = (uint8_t)(shards - 1);
     meta->slot_shift = (uint8_t)__builtin_ctzll(data_size / shards);
@@ -449,21 +559,105 @@ int sbo_init(void *metaptr, size_t head_size, size_t data_size) {
             bs = nbs;
         }
         if (si == 0) {
+            meta->sizeof_block_head = head;
             meta->box_off = (uint8_t)(head + pad);
             meta->block_stride = (uint16_t)(head + bs);
             if ((meta->block_stride & 7) != 0 || (meta->box_off & 7) != 0)
                 return -1;
+            meta->max_blocks = (uint32_t)(per_slot_meta / meta->block_stride);
         }
         if (blocks_alloc(pm, pool) != 0) return -1;
         sbo_box_format((sbo_box_t *)(pool + meta->box_off), root_level, -1, 255, 0);
     }
 
+#ifndef SBO_NO_TLS
+    if (sbo_tls.meta == (const void *)meta) { sbo_tls.meta = NULL; sbo_tls.home = -1; sbo_tls.miss = 0; }
+#endif
     memcpy(meta->magic, SBO_MAGIC, sizeof(SBO_MAGIC) - 1);
     return 0;
 }
 
-static bool sbo_try_hint(const sbo_ctx_t *c, sbo_box_t *root, sbo_usage_t usage,
+/* Single-root (root_slots == 1) layout & online SHM growth helpers. */
+static inline blocks_meta_t *sbo_pool(sbo_meta_t *m) {
+    return sbo_pool_meta(m, 0);
+}
+static inline sbo_lock_t *sbo_plock(sbo_meta_t *m) {
+    return sbo_pool_lock(m, 0);
+}
+static inline uint8_t *sbo_pmem(sbo_meta_t *m) {
+    return sbo_pool_mem(m, 0);
+}
+static inline sbo_box_t *sbo_box(sbo_meta_t *m, int32_t id) {
+    return (sbo_box_t *)(sbo_pmem(m) + (size_t)id * m->block_stride + m->box_off);
+}
+bool sbo_pool_full(sbo_meta_t *m) {
+    blocks_meta_t *p = sbo_pool(m);
+    if (p->free_next_id != -1) return false;
+    uint64_t next_end = (uint64_t)block_offset(p, p->malloc_blocks) +
+                        p->sizeof_block_head + p->block_size;
+    return next_end > p->total_size;
+}
+void sbo_head_grow_apply(sbo_meta_t *m, uint64_t new_pool_bytes) {
+    blocks_meta_t *p = sbo_pool(m);
+    p->total_size = new_pool_bytes;
+    m->per_slot_meta = new_pool_bytes;
+    m->head_size = SBO_HEAD_FIXED + new_pool_bytes;
+    m->max_blocks = (uint32_t)(new_pool_bytes / m->block_stride);
+}
+int sbo_data_grow_apply(sbo_meta_t *m, uint64_t new_data_size) {
+    if (m->root_slots != 1 || new_data_size != m->data_size * SBO_N) return -1;
+    sbo_lock_t *lk = sbo_plock(m);
+    sbo_ctx_t c = sbo_ctx_for(m, 0, lk);
+    int64_t nid = blocks_alloc(c.pool_meta, c.pool);
+    if (nid < 0) return -1;
+    sbo_box_t *root = sbo_box_at(&c, 0), *b = sbo_box_at(&c, (int32_t)nid);
+    memcpy(b, root, sizeof(*b));
+    b->parent = 0;
+    b->parent_slot = 0;
+    b->self_id = (int32_t)nid;
+    uint64_t mm = root->child_mask;
+    while (mm) {
+        int i = __builtin_ctzll(mm);
+        mm &= mm - 1;
+        sbo_box_at(&c, root->children[i])->parent = (int32_t)nid;
+    }
+    uint8_t old_lvl = b->objlevel;
+    if (old_lvl >= 1 && old_lvl <= 3 && lk->hot_id1[old_lvl - 1] == 1)
+        lk->hot_id1[old_lvl - 1] = (uint32_t)nid + 1;
+    uint8_t lvl = (uint8_t)(old_lvl + 1);
+    sbo_box_format(root, lvl, -1, 255, 0);
+    root->free_mask = ~1ULL;
+    root->child_mask = 1ULL;
+    root->states[0] = SBO_BOX;
+    root->children[0] = (int32_t)nid;
+    uint16_t b_comb = sbo_combined(b);
+    root->child_cap[0] = b_comb;
+    root->child_max_enc = b_comb;
+    root->child_max_count = 1;
+    root->max_obj_cap = SBO_MULT_MAX;
+    root->hint_child = 0;
+    m->data_size = new_data_size;
+    m->slot_bytes = new_data_size;
+    m->slot_shift = (uint8_t)__builtin_ctzll(new_data_size);
+    return 0;
+}
+
+static bool sbo_try_hint(sbo_ctx_t *c, sbo_box_t *root, sbo_usage_t usage,
                          uint16_t need_enc, uint64_t *off_out) {
+    if (usage.level >= 1 && usage.level <= 3) {
+        uint32_t id1 = c->lk->hot_id1[usage.level - 1];
+        if (id1 != 0) {
+            sbo_box_t *hb = sbo_box_at(c, (int32_t)(id1 - 1));
+            if (hb->objlevel == usage.level && hb->max_obj_cap >= usage.multiple) {
+                int slot = sbo_alloc_obj_slots(c, hb, usage.multiple);
+                if (slot >= 0) {
+                    *off_out = c->lk->hot_base[usage.level - 1]
+                               + sbo_offset_raw(usage.level, (uint8_t)slot);
+                    return true;
+                }
+            }
+        }
+    }
     sbo_box_t *box = root;
     uint64_t base = 0;
     for (int guard = 0; guard < 16 && usage.level < box->objlevel; guard++) {
@@ -480,6 +674,10 @@ static bool sbo_try_hint(const sbo_ctx_t *c, sbo_box_t *root, sbo_usage_t usage,
     if (usage.level != box->objlevel) return false;
     int slot = sbo_alloc_obj_slots(c, box, usage.multiple);
     if (slot < 0) return false;
+    if (usage.level >= 1 && usage.level <= 3) {
+        c->lk->hot_id1[usage.level - 1] = (uint32_t)box->self_id + 1;
+        c->lk->hot_base[usage.level - 1] = base;
+    }
     *off_out = base + sbo_offset_raw(box->objlevel, (uint8_t)slot);
     return true;
 }
@@ -495,6 +693,7 @@ uint64_t sbo_alloc(void *metaptr, size_t size) {
     uint16_t need_enc = sbo_enc_of(usage);
     int shards = meta->root_slots;
     int home = sbo_home_shard(meta);
+    bool home_full = false;
 
     for (int pass = 0; pass < 2; pass++) {
         for (int t = 0; t < shards; t++) {
@@ -503,21 +702,38 @@ uint64_t sbo_alloc(void *metaptr, size_t size) {
             if (pass == 0) { if (!sbo_trylock(lk)) continue; }
             else sbo_lock(lk);
 
-            sbo_ctx_t c = sbo_ctx_for(meta, (uint8_t)si);
+            sbo_ctx_t c = sbo_ctx_for(meta, (uint8_t)si, lk);
             sbo_box_t *root = sbo_box_at(&c, 0);
             uint64_t off = SBO_ALLOC_FAIL;
+            if (sbo_combined(root) < need_enc && root->child_mask)
+                sbo_reclaim_empty(&c, root);
             if (sbo_combined(root) >= need_enc) {
-                if (!sbo_try_hint(&c, root, usage, need_enc, &off))
+                if (!sbo_try_hint(&c, root, usage, need_enc, &off)) {
                     off = sbo_find_alloc(&c, root, usage, need_enc);
+                    if (off != SBO_ALLOC_FAIL && usage.level >= 1 && usage.level <= 3
+                        && c.last_id >= 0) {
+                        uint32_t bsh = (uint32_t)usage.level * SBO_N_BITS + 3;
+                        lk->hot_id1[usage.level - 1] = (uint32_t)c.last_id + 1;
+                        lk->hot_base[usage.level - 1] =
+                            bsh < 64 ? (off & ~((1ULL << bsh) - 1)) : 0;
+                    }
+                }
             }
             sbo_unlock(lk);
 
             if (off != SBO_ALLOC_FAIL) {
 #ifndef SBO_NO_TLS
-                if (sbo_tls_meta == (const void *)meta) sbo_tls_home = si;
+                if (t == 0) {
+                    sbo_tls.miss = 0;
+                } else if (sbo_tls.meta == (const void *)meta
+                           && (home_full || ++sbo_tls.miss >= 4)) {
+                    sbo_tls.home = (int16_t)si;
+                    sbo_tls.miss = 0;
+                }
 #endif
                 return ((uint64_t)si << meta->slot_shift) + off;
             }
+            if (t == 0) home_full = true;
         }
     }
     return SBO_ALLOC_FAIL;
@@ -530,13 +746,31 @@ static inline bool sbo_offset_ok(const sbo_meta_t *meta, uint64_t obj_offset) {
 }
 
 static inline sbo_box_t *sbo_lookup_locked(sbo_meta_t *meta, uint64_t obj_offset,
-                                           sbo_ctx_t *c, sbo_lock_t **lk,
+                                           sbo_ctx_t *c, sbo_lock_t **lk_out,
                                            uint8_t *slot) {
     uint8_t si = (uint8_t)(obj_offset >> meta->slot_shift);
-    *lk = sbo_pool_lock(meta, si);
-    sbo_lock(*lk);
-    *c = sbo_ctx_for(meta, si);
-    return sbo_find_obj_node(c, sbo_box_at(c, 0), obj_offset, slot);
+    sbo_lock_t *lk = sbo_pool_lock(meta, si);
+    *lk_out = lk;
+    sbo_lock(lk);
+    *c = sbo_ctx_for(meta, si, lk);
+    uint64_t local_off = obj_offset & ((1ULL << meta->slot_shift) - 1);
+    for (uint8_t lv = 1; lv <= 2; lv++) {
+        uint32_t id1 = lk->hot_id1[lv - 1];
+        if (!id1) continue;
+        uint32_t sh = (uint32_t)(lv - 1) * SBO_N_BITS + 3;
+        uint64_t rel = local_off - lk->hot_base[lv - 1];
+        if ((rel & ~((uint64_t)SBO_N_MASK << sh)) == 0) {
+            uint8_t s = (uint8_t)(rel >> sh);
+            sbo_box_t *hb = sbo_box_at(c, (int32_t)(id1 - 1));
+            uint8_t st = hb->states[s];
+            if (hb->objlevel == lv && SBO_IS_START(st)
+                && s + SBO_START_LEN(st) <= SBO_N) {
+                *slot = s;
+                return hb;
+            }
+        }
+    }
+    return sbo_find_obj_node(c, sbo_box_at(c, 0), local_off, slot);
 }
 
 void sbo_free(void *metaptr, uint64_t obj_offset) {

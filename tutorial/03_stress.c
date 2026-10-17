@@ -7,15 +7,17 @@
 
 #define SMALL_OBJ_SIZE 8
 
+#define DATA_SIZE (8ULL * 64 * 64 * 64)
+
 int main() {
-    uint8_t *buddy = malloc(4 * 1024 * 1024);
-    uint8_t *data = malloc(64 * 1024 * 1024);
+    uint8_t *buddy = calloc(1, 4 * 1024 * 1024);
+    uint8_t *data = malloc(DATA_SIZE);
     if (!buddy || !data) {
         perror("Failed to allocate memory for slotsboxmalloc");
         return 1;
     }
 
-    if (sbo_init(buddy, 4 * 1024 * 1024, 64 * 1024 * 1024) != 0) {
+    if (sbo_init(buddy, 4 * 1024 * 1024, DATA_SIZE) != 0) {
         printf("Failed to initialize slotsboxmalloc\n");
         free(buddy);
         free(data);

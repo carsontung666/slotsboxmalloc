@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 /* Randomized model check: no overlap, exact capacity, no false OOM. */
 #include <pthread.h>
 #include <stdio.h>
@@ -165,6 +165,12 @@ static void phase_edges(void) {
     uint64_t off = sbo_alloc(g_meta, 2064384);
     if (off == FAIL64 || sbo_allocated_size(g_meta, off) != 2064384) g_err++;
     if (off != FAIL64) sbo_free(g_meta, off);
+    off = sbo_alloc(g_meta, 512);
+    if (off == FAIL64) { g_err++; return; }
+    if (sbo_allocated_size(g_meta, off + 8) != 0) g_err++;
+    sbo_free(g_meta, off + 8);
+    if (sbo_allocated_size(g_meta, off) != 512) g_err++;
+    sbo_free(g_meta, off);
     off = sbo_alloc(g_meta, 8);
     if (off == FAIL64) { g_err++; return; }
     sbo_free(g_meta, off + 3);
@@ -176,6 +182,9 @@ static void phase_edges(void) {
     if (sbo_alloc(g_meta, 8) != FAIL64) g_err++;
     if (sbo_allocated_size(g_meta, off) != 0) g_err++;
     sbo_free(g_meta, off);
+    uint8_t *tiny = calloc(1, 8);
+    if (!tiny || sbo_init(tiny, 8, DATA_SIZE) == 0) g_err++;
+    free(tiny);
     printf("D edges done (errors so far=%ld)\n", (long)g_err);
 }
 
@@ -187,13 +196,23 @@ static void phase_small_arenas(void) {
         if (!m) { g_err++; continue; }
         if (sbo_init(m, ms, datas[d]) != 0) { printf("small %zu: init fail\n", datas[d]); g_err++; free(m); continue; }
         size_t maxsz = datas[d] / 64 * 63;
+        uint64_t o1 = sbo_alloc(m, 504), o2 = (datas[d] > 512) ? sbo_alloc(m, 504) : 0;
+        if (o1 == FAIL64 || o2 == FAIL64) g_err++;
+        if (o1 != FAIL64) sbo_free(m, o1);
+        if (datas[d] > 512 && o2 != FAIL64) sbo_free(m, o2);
         uint64_t off = sbo_alloc(m, maxsz);
         if (off == FAIL64 || sbo_allocated_size(m, off) != expect_cap(maxsz)) g_err++;
         if (off != FAIL64) sbo_free(m, off);
-        off = sbo_alloc(m, 8);
-        if (off == FAIL64) g_err++; else sbo_free(m, off);
         free(m);
     }
+    uint8_t *m2 = calloc(1, 1152);
+    if (!m2 || sbo_init(m2, 1152, 2097152) != 0) { g_err++; free(m2); return; }
+    if (sbo_alloc(m2, 8) != FAIL64) g_err++;
+    uint64_t b1 = sbo_alloc(m2, 1048576), b2 = sbo_alloc(m2, 1048576);
+    if (b1 == FAIL64 || b2 == FAIL64) g_err++;
+    if (b1 != FAIL64) sbo_free(m2, b1);
+    if (b2 != FAIL64) sbo_free(m2, b2);
+    free(m2);
     uint8_t *m = calloc(1, 1 << 20);
     if (!m) { g_err++; return; }
     if (sbo_init(m, 1 << 20, 1000) == 0) g_err++;
@@ -222,6 +241,54 @@ static void phase_single_shard_mt(int nthr, int iters) {
     printf("F single-shard MT done (errors so far=%ld)\n", (long)g_err);
 }
 
+static void phase_grow(void) {
+    size_t init_data = 8ULL * 64 * 64 * 64; /* 2MB, 1 shard */
+    size_t init_pool = 64 * 1024;
+    size_t init_head = sbo_meta_size(init_data, init_pool);
+    size_t head_fixed = init_head - init_pool;
+    size_t max_head = head_fixed + 256 * 1024;
+    uint8_t *m = calloc(1, max_head);
+    if (!m) { g_err++; return; }
+    if (sbo_init(m, init_head, init_data) != 0) {
+        printf("grow: init fail\n");
+        g_err++; free(m); return;
+    }
+    sbo_meta_t *meta = (sbo_meta_t *)m;
+    if (meta->root_slots != 1 || ((uint8_t *)m)[48] != 1) g_err++;
+    if (sbo_pool_full(meta)) g_err++;
+
+    /* Allocate two 900KB objects (29 * 32KB = 950272B each), third must fail */
+    uint64_t o_small = sbo_alloc(m, 100);
+    uint64_t o1 = sbo_alloc(m, 900 * 1024);
+    uint64_t o2 = sbo_alloc(m, 900 * 1024);
+    if (o_small == FAIL64 || o1 == FAIL64 || o2 == FAIL64) g_err++;
+    if (sbo_alloc(m, 900 * 1024) != FAIL64) g_err++;
+
+    /* Grow data x64 (2MB -> 128MB) */
+    if (sbo_data_grow_apply(meta, init_data * 64) != 0) g_err++;
+
+    if (sbo_allocated_size(m, o_small) != expect_cap(100)) g_err++;
+    if (sbo_allocated_size(m, o1) != expect_cap(900 * 1024)) g_err++;
+    if (sbo_allocated_size(m, o2) != expect_cap(900 * 1024)) g_err++;
+
+    uint64_t o3 = sbo_alloc(m, 900 * 1024);
+    uint64_t o_huge = sbo_alloc(m, 3 * 1024 * 1024);
+    if (o3 == FAIL64 || o_huge == FAIL64) g_err++;
+    if (sbo_allocated_size(m, o_huge) != expect_cap(3 * 1024 * 1024)) g_err++;
+
+    /* Grow head pool (64KB -> 128KB) */
+    sbo_head_grow_apply(meta, init_pool * 2);
+    if (meta->head_size != head_fixed + init_pool * 2) g_err++;
+
+    sbo_free(m, o_small);
+    sbo_free(m, o1);
+    sbo_free(m, o2);
+    sbo_free(m, o3);
+    sbo_free(m, o_huge);
+    free(m);
+    printf("G online grow done (errors so far=%ld)\n", (long)g_err);
+}
+
 int main(int argc, char **argv) {
     if (argc > 3) { printf("usage: %s [threads 1..254] [iters>=1]\n", argv[0]); return 2; }
     int nthr = argc > 1 ? atoi(argv[1]) : 4;
@@ -240,6 +307,7 @@ int main(int argc, char **argv) {
     phase_edges();
     phase_small_arenas();
     phase_single_shard_mt(nthr, iters);
+    phase_grow();
     printf("18_model_check: %s\n", g_err == 0 ? "PASS" : "FAIL");
     free(g_meta); free(g_data); free(g_claim);
     return g_err == 0 ? 0 : 1;
