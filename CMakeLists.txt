@@ -6,11 +6,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 # shared library (for FFI) + header-only (with SLOTSBOXMALLOC_IMPLEMENTATION)
 add_library(slotsboxmalloc SHARED
     src/slotsboxmalloc.c
 )
+target_link_libraries(slotsboxmalloc PUBLIC Threads::Threads)
 target_include_directories(slotsboxmalloc
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

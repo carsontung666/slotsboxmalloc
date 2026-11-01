@@ -78,3 +78,10 @@ add_executable(18_model_check 18_model_check.c)
 target_link_libraries(18_model_check slotsboxmalloc Threads::Threads)
 add_test(NAME 18_model_check COMMAND 18_model_check 4 10000)
 set_tests_properties(18_model_check PROPERTIES TIMEOUT 120)
+
+# -- 19: crash recovery (dead or zombie PID lock takeover and tree repair) --
+add_executable(19_crash_recovery 19_crash_recovery.c)
+target_include_directories(19_crash_recovery PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(19_crash_recovery Threads::Threads)
+add_test(NAME 19_crash_recovery COMMAND 19_crash_recovery)
+set_tests_properties(19_crash_recovery PROPERTIES TIMEOUT 60)
